@@ -1,0 +1,5 @@
+(sym_lib_table
+  (version 7)
+  (lib (name "Custom")(type "Legacy")(uri "${KIPRJMOD}/Custom.lib")(options "")(descr ""))
+  (lib (name "bms4_f051-rescue")(type "KiCad")(uri "${KIPRJMOD}/bms4_f051-rescue.kicad_sym")(options "")(descr ""))
+)

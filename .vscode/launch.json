@@ -1,0 +1,54 @@
+{
+    /* 
+     * Requires the Rust Language Server (rust-analyzer) and Cortex-Debug extensions
+     * https://marketplace.visualstudio.com/items?itemName=rust-lang.rust-analyzer
+     * https://marketplace.visualstudio.com/items?itemName=marus25.cortex-debug
+     */
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "type": "cortex-debug",
+            "request": "launch",
+            "name": "Debug (QEMU)",
+            "servertype": "qemu",
+            "cwd": "${workspaceRoot}",
+            "preLaunchTask": "Cargo Build (debug)",
+            "runToEntryPoint": "main",
+            "executable": "./target/thumbv7m-none-eabi/debug/bms4-rust",
+            /* Run `cargo build --example hello` and uncomment this line to run semi-hosting example */
+            //"executable": "./target/thumbv7m-none-eabi/debug/examples/hello",
+            "cpu": "cortex-m3",
+            "machine": "lm3s6965evb",
+        },
+        {
+            /* Configuration for the STM32F051 */
+            "type": "cortex-debug",
+            "request": "launch",
+            "name": "Debug (OpenOCD)",
+            "servertype": "openocd",
+            "cwd": "${workspaceRoot}",
+            "preLaunchTask": "Cargo Build (debug)",
+            "runToEntryPoint": "main",
+            "executable": "./target/thumbv6m-none-eabi/debug/bms4-rust",
+            /* Run `cargo build --example itm` and uncomment this line to run itm example */
+            // "executable": "./target/thumbv7em-none-eabihf/debug/examples/itm",
+            "device": "STM32F051K8",
+            "configFiles": [
+                "interface/stlink-v2-1.cfg",
+                "target/stm32f0x.cfg"
+            ],
+            "svdFile": "${workspaceRoot}/.vscode/STM32F0x1.svd",
+            "swoConfig": {
+                "enabled": false,
+                "cpuFrequency": 8000000,
+                "swoFrequency": 2000000,
+                "source": "probe",
+                "decoders": [
+                    { "type": "console", "label": "ITM", "port": 0 }
+                ]
+            },
+            // change the following line to point to your ARM toolchain (where to find arm-none-eabi-gdb.exe)
+            "armToolchainPath": "C:/Program Files (x86)/Arm GNU Toolchain arm-none-eabi/12.3 rel1/bin"
+        }
+    ]
+}
