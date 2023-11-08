@@ -9,6 +9,6 @@ Balancing is performed by 33 ohm shunt resistors, one per cell. The are turned o
 Communication is done through an isolation circuit (ISO7221D). This is used to be able to communicate to other bms4_f051 boards in a series battery configuration. In series, the boards will not share grounds. Connecting one board's ground to another board's ground would create a dangerous short circuit through the LiIon batteries! The boards are designed to be daisy-chained in communication, with the bottom-most (or top-most, your choice) board connected to an external controller, for example an ebike motor controller.
 
 ## Board Images
-![Board Top](/img/board_top.png "Board Top")
-![Board Bottom](/img/board_bottom.png "Board Bottom")
-![Schematic](/img/schematic.png "Schematic")
+![Board Top](/hardware/img/board_top.png "Board Top")
+![Board Bottom](/hardware/img/board_bottom.png "Board Bottom")
+![Schematic](/hardware/img/schematic.png "Schematic")
