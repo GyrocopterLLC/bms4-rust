@@ -59,5 +59,34 @@
             "problemMatcher": [],
             "group": "build"
         },
+        {
+            "label": "Flash",
+            "type": "shell",
+            "command": "openocd",
+            "args": [
+              "-f",
+              "interface/stlink-v2-1.cfg",
+              "-f",
+              "target/stm32f0x.cfg",
+              "-c",
+              "adapter speed 5000; program .\\\\target\\\\thumbv6m-none-eabi\\\\debug\\\\${workspaceFolderBasename} verify reset exit"
+            ],
+            "problemMatcher": []
+          },
+          
+        {
+            "label": "Flash (release)",
+            "type": "shell",
+            "command": "openocd",
+            "args": [
+              "-f",
+              "interface/stlink-v2-1.cfg",
+              "-f",
+              "target/stm32f0x.cfg",
+              "-c",
+              "adapter speed 5000; program .\\\\target\\\\thumbv6m-none-eabi\\\\release\\\\${workspaceFolderBasename} verify reset exit"
+            ],
+            "problemMatcher": []
+          },
     ]
 }

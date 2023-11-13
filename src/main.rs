@@ -10,22 +10,35 @@ use panic_halt as _;
 
 use stm32f0xx_hal as hal;
 
-use crate::hal::{gpio::*, pac, prelude::*};
+use crate::hal::{gpio::*, pac, adc::*, prelude::*};
 
 use cortex_m::{interrupt::Mutex, peripheral::syst::SystClkSource::Core, Peripherals};
 use cortex_m_rt::{entry, exception};
 
 use core::cell::RefCell;
-use core::ops::DerefMut;
+use core::ops::{DerefMut, Deref};
+
+//mod adc_helper;
 
 struct LEDS{
     green: gpioa::PA15<Output<PushPull>>,
     red: gpiob::PB3<Output<PushPull>>
 }
 
-// Mutex protected structure for our shared GPIO pin
-//static GPIO: Mutex<RefCell<Option<gpioa::PA15<Output<PushPull>>>>> = Mutex::new(RefCell::new(None));
+struct AdcPins {
+    bat1: gpioa::PA5<Analog>,
+    bat2: gpioa::PA4<Analog>,
+    bat3: gpioa::PA1<Analog>,
+    bat4: gpioa::PA0<Analog>
+}
+
+const ADC_FLAG:u32 = 1;
+
 static GPIO_LEDS: Mutex<RefCell<Option<LEDS>>> = Mutex::new(RefCell::new(None));
+static GPIO_ADCS: Mutex<RefCell<Option<AdcPins>>> = Mutex::new(RefCell::new(None));
+static MAIN_LOOP_FLAGS: Mutex<RefCell<u32>> = Mutex::new(RefCell::new(0));
+static ADC_RESULTS: Mutex<RefCell<[u32;4]>> = Mutex::new(RefCell::new([0;4]));
+static ADC_PERIPH: Mutex<RefCell<Option<Adc>>> = Mutex::new(RefCell::new(None));
 
 #[entry]
 fn main() -> ! {
@@ -37,11 +50,34 @@ fn main() -> ! {
             let gpiob = p.GPIOB.split(&mut rcc);
 
             // (Re-)configure PA15 and PB3 as output
-            let ledg = gpioa.pa15.into_push_pull_output(cs);
-            let ledr = gpiob.pb3.into_push_pull_output(cs);
+            let mut ledg = gpioa.pa15.into_push_pull_output(cs);
+            let mut ledr = gpiob.pb3.into_push_pull_output(cs);
+
+            // Ensure the LEDs are off
+            ledg.set_low().ok();
+            ledr.set_low().ok();
+
+            // Configure ADC inputs: PA5, 4, 1, and 0 (In1, 2, 3, and 4 respectively)
+            let in1 = gpioa.pa5.into_analog(cs);
+            let in2 = gpioa.pa4.into_analog(cs);
+            let in3 = gpioa.pa1.into_analog(cs);
+            let in4 = gpioa.pa0.into_analog(cs);
+            
+            let mut madc = Adc::new(p.ADC, &mut rcc);
+
+            // Get that ADC initialized
+            adc_init(&mut madc);
+
+            
+            *ADC_PERIPH.borrow(cs).borrow_mut() = Some(madc);
 
             // Transfer GPIO into a shared structure
             *GPIO_LEDS.borrow(cs).borrow_mut() = Some(LEDS{green:ledg, red:ledr});
+            *GPIO_ADCS.borrow(cs).borrow_mut() = Some(AdcPins{bat1:in1, bat2:in2, bat3: in3, bat4: in4});
+
+            // Initialize globals
+            *MAIN_LOOP_FLAGS.borrow(cs).borrow_mut() = 0;
+            *ADC_RESULTS.borrow(cs).borrow_mut() = [0;4];
 
             let mut syst = cp.SYST;
 
@@ -63,8 +99,52 @@ fn main() -> ! {
     }
 
     loop {
-        continue;
+        // Superloop controls the different functions
+        // Timer used to initiate functions
+
+        let run_adc: bool = cortex_m::interrupt::free(|cs| -> bool {
+            let flags = *MAIN_LOOP_FLAGS.borrow(cs).borrow();
+            (flags & ADC_FLAG) != 0
+            //flags & ADC_FLAG != 0 // return value is true if the ADC_FLAG bit is set
+        });
+
+        if run_adc {
+            
+
+
+            
+            cortex_m::interrupt::free(|cs| {
+                let mut flags = *MAIN_LOOP_FLAGS.borrow(cs).borrow();
+                flags = flags & (!ADC_FLAG);
+                *MAIN_LOOP_FLAGS.borrow(cs).borrow_mut() = flags;
+                if let (Some(adc_channels), Some(adc_periph)) = 
+                    (GPIO_ADCS.borrow(cs).borrow_mut().deref_mut(), ADC_PERIPH.borrow(cs).borrow_mut().deref_mut())
+                {
+                    let mut adc_results:[u32;4] = [0;4];
+                    for i in 0..4 {
+                        adc_results[i] = match i {
+                            0 => adc_periph.read(&mut adc_channels.bat1).ok().unwrap_or_default(),
+                            1 => adc_periph.read(&mut adc_channels.bat2).ok().unwrap_or_default(),
+                            2 => adc_periph.read(&mut adc_channels.bat3).ok().unwrap_or_default(),
+                            _ => adc_periph.read(&mut adc_channels.bat4).ok().unwrap_or_default()
+                        };
+                    }
+
+                    *ADC_RESULTS.borrow(cs).borrow_mut() = adc_results;
+
+                };
+
+            });
+            
+        }
     }
+}
+
+fn adc_init(madc: &mut Adc) {
+    madc.set_sample_time(AdcSampleTime::T_239);
+    madc.set_precision(AdcPrecision::B_12);
+    madc.set_align(AdcAlign::Right);
+
 }
 
 // Define an exception handler, i.e. function to call when exception occurs. Here, if our SysTick
@@ -77,7 +157,7 @@ fn SysTick() {
     // Enter critical section
     cortex_m::interrupt::free(|cs| {
         // Borrow access to our GPIO pin from the shared structure
-        if let Some(ref mut led) = *GPIO_LEDS.borrow(cs).borrow_mut().deref_mut() {
+        if let Some(ref mut led) = GPIO_LEDS.borrow(cs).borrow_mut().deref_mut() {
             // Check state variable, keep LED off most of the time and turn it on every 10th tick
             if *STATE < 10 {
                 // Turn off the LED
@@ -93,6 +173,10 @@ fn SysTick() {
 
                 // And set new state variable back to 0
                 *STATE = 0;
+
+                let mut flags = *MAIN_LOOP_FLAGS.borrow(cs).borrow().deref();
+                flags = flags | ADC_FLAG;
+                *MAIN_LOOP_FLAGS.borrow(cs).borrow_mut() = flags;
             }
         }
     });
