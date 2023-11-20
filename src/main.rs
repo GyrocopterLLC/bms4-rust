@@ -6,6 +6,10 @@
 #![no_main]
 #![no_std]
 
+use adc_helper::HelpfulAdc;
+use hal::pac::Interrupt;
+use hal::pac::interrupt;
+use hal::pac::adc::smpr::SMP_A;
 use panic_halt as _;
 
 use stm32f0xx_hal as hal;
@@ -16,9 +20,10 @@ use cortex_m::{interrupt::Mutex, peripheral::syst::SystClkSource::Core, Peripher
 use cortex_m_rt::{entry, exception};
 
 use core::cell::RefCell;
+use core::cell::UnsafeCell;
 use core::ops::{DerefMut, Deref};
 
-//mod adc_helper;
+mod adc_helper;
 
 struct LEDS{
     green: gpioa::PA15<Output<PushPull>>,
@@ -32,18 +37,47 @@ struct AdcPins {
     bat4: gpioa::PA0<Analog>
 }
 
+struct ForceSync<T> {
+    inner: UnsafeCell<T>,
+}
+
+impl<T> ForceSync<T> {
+    /// Creates a new sync forcer
+    const fn new(value: T) -> Self {
+        ForceSync {
+            inner: UnsafeCell::new(value),
+        }
+    }
+
+    fn borrow(& self) -> & T {
+        unsafe { &*self.inner.get() }
+    }
+}
+
+unsafe impl<T> Sync for ForceSync<T> where T: Send {}
+
+
 const ADC_FLAG:u32 = 1;
+const ADC_COMPLETE_FLAG:u32 = 2;
 
 static GPIO_LEDS: Mutex<RefCell<Option<LEDS>>> = Mutex::new(RefCell::new(None));
 static GPIO_ADCS: Mutex<RefCell<Option<AdcPins>>> = Mutex::new(RefCell::new(None));
 static MAIN_LOOP_FLAGS: Mutex<RefCell<u32>> = Mutex::new(RefCell::new(0));
-static ADC_RESULTS: Mutex<RefCell<[u32;4]>> = Mutex::new(RefCell::new([0;4]));
-static ADC_PERIPH: Mutex<RefCell<Option<Adc>>> = Mutex::new(RefCell::new(None));
-
+static ADC_RESULTS: Mutex<RefCell<[u16;4]>> = Mutex::new(RefCell::new([0;4]));
+//#[link_section=".data"]
+//static ADC_RESULTS: [u16;4] = [0;4];
+//static ADC_RESULTS: ForceSync<RefCell<[u16;4]>> = ForceSync::new(RefCell::new([0;4]));
+static DMA_PERIPH: Mutex<RefCell<Option<pac::DMA1>>> = Mutex::new(RefCell::new(None));
+// static ADC_PERIPH: Mutex<RefCell<Option<Adc>>> = Mutex::new(RefCell::new(None));
+static ADC_PERIPH: Mutex<RefCell<Option<HelpfulAdc>>> = Mutex::new(RefCell::new(None));
 #[entry]
 fn main() -> ! {
+    //let mut adc_results = [0_u16;4];
+
+
     if let (Some(mut p), Some(cp)) = (pac::Peripherals::take(), Peripherals::take()) {
         cortex_m::interrupt::free(move |cs| {
+            
             let mut rcc = p.RCC.configure().sysclk(48.mhz()).freeze(&mut p.FLASH);
 
             let gpioa = p.GPIOA.split(&mut rcc);
@@ -58,26 +92,36 @@ fn main() -> ! {
             ledr.set_low().ok();
 
             // Configure ADC inputs: PA5, 4, 1, and 0 (In1, 2, 3, and 4 respectively)
-            let in1 = gpioa.pa5.into_analog(cs);
-            let in2 = gpioa.pa4.into_analog(cs);
-            let in3 = gpioa.pa1.into_analog(cs);
-            let in4 = gpioa.pa0.into_analog(cs);
+            let mut in1 = gpioa.pa5.into_analog(cs);
+            let mut in2 = gpioa.pa4.into_analog(cs);
+            let mut in3 = gpioa.pa1.into_analog(cs);
+            let mut in4 = gpioa.pa0.into_analog(cs);
             
-            let mut madc = Adc::new(p.ADC, &mut rcc);
+            // let mut madc = Adc::new(p.ADC, &mut rcc);
+            //let mut madc = HelpfulAdc::new(p.ADC, &mut rcc.regs);
+            // Annoyingly, using the HAL causes us to lose access to the underlying RCC registers
+            // And the features we need (like enabling HSI14, enabling DMA clock) are not available
+            // through the HAL. 
+            // So we resort to thievery.
+            let mut stolen_p: pac::Peripherals;
+            unsafe{ stolen_p = pac::Peripherals::steal(); }
 
-            // Get that ADC initialized
-            adc_init(&mut madc);
+            let mut madc = HelpfulAdc::new(p.ADC, &mut stolen_p.RCC); 
+            let dest:u32 = ADC_RESULTS.borrow(cs).as_ptr() as u32;
+            madc.dma_en(&mut p.DMA1, &mut p.SYSCFG, &mut stolen_p.RCC, dest);
+            //madc.dma_en(&mut p.DMA1, &mut p.SYSCFG, &mut stolen_p.RCC, &ADC_RESULTS);
 
-            
+            madc.set_sample_time(SMP_A::CYCLES13_5);
+            madc.set_pin(&mut in1);
+            madc.set_pin(&mut in2);
+            madc.set_pin(&mut in3);
+            madc.set_pin(&mut in4);
+            *DMA_PERIPH.borrow(cs).borrow_mut() = Some(p.DMA1);
             *ADC_PERIPH.borrow(cs).borrow_mut() = Some(madc);
 
             // Transfer GPIO into a shared structure
             *GPIO_LEDS.borrow(cs).borrow_mut() = Some(LEDS{green:ledg, red:ledr});
             *GPIO_ADCS.borrow(cs).borrow_mut() = Some(AdcPins{bat1:in1, bat2:in2, bat3: in3, bat4: in4});
-
-            // Initialize globals
-            *MAIN_LOOP_FLAGS.borrow(cs).borrow_mut() = 0;
-            *ADC_RESULTS.borrow(cs).borrow_mut() = [0;4];
 
             let mut syst = cp.SYST;
 
@@ -108,15 +152,25 @@ fn main() -> ! {
             //flags & ADC_FLAG != 0 // return value is true if the ADC_FLAG bit is set
         });
 
+        let adc_complete: bool = cortex_m::interrupt::free(|cs| -> bool {
+            let flags = *MAIN_LOOP_FLAGS.borrow(cs).borrow();
+            (flags & ADC_COMPLETE_FLAG) != 0
+            //flags & ADC_FLAG != 0 // return value is true if the ADC_FLAG bit is set
+        });
+
         if run_adc {
-            
-
-
-            
+                      
             cortex_m::interrupt::free(|cs| {
                 let mut flags = *MAIN_LOOP_FLAGS.borrow(cs).borrow();
                 flags = flags & (!ADC_FLAG);
                 *MAIN_LOOP_FLAGS.borrow(cs).borrow_mut() = flags;
+
+                if let (Some(adc_periph), Some(dma_periph)) = 
+                    (ADC_PERIPH.borrow(cs).borrow_mut().deref_mut(), DMA_PERIPH.borrow(cs).borrow_mut().deref_mut()) {
+                        adc_periph.dma_start(dma_periph);
+                }
+
+                /*
                 if let (Some(adc_channels), Some(adc_periph)) = 
                     (GPIO_ADCS.borrow(cs).borrow_mut().deref_mut(), ADC_PERIPH.borrow(cs).borrow_mut().deref_mut())
                 {
@@ -132,19 +186,27 @@ fn main() -> ! {
 
                     *ADC_RESULTS.borrow(cs).borrow_mut() = adc_results;
 
-                };
+                }; */
 
             });
-            
+        }
+
+        if adc_complete {
+            // check our values
+            //if(ADC_RESULTS[0] < ADC_RESULTS[3]) {
+                // put on a light show
+            cortex_m::interrupt::free(|cs| {
+                let adc_conversions = *ADC_RESULTS.borrow(cs).borrow();
+                if adc_conversions[0] < adc_conversions[3] {
+
+                    if let Some(ref mut led) = GPIO_LEDS.borrow(cs).borrow_mut().deref_mut() {
+                        led.red.set_high().ok();
+                    }
+                }
+            });
+            //}
         }
     }
-}
-
-fn adc_init(madc: &mut Adc) {
-    madc.set_sample_time(AdcSampleTime::T_239);
-    madc.set_precision(AdcPrecision::B_12);
-    madc.set_align(AdcAlign::Right);
-
 }
 
 // Define an exception handler, i.e. function to call when exception occurs. Here, if our SysTick
@@ -162,14 +224,14 @@ fn SysTick() {
             if *STATE < 10 {
                 // Turn off the LED
                 led.green.set_low().ok();
-                led.red.set_high().ok();
+                //led.red.set_high().ok();
 
                 // And now increment state variable
                 *STATE += 1;
             } else {
                 // Turn on the LED
                 led.green.set_high().ok();
-                led.red.set_low().ok();
+                //led.red.set_low().ok();
 
                 // And set new state variable back to 0
                 *STATE = 0;
@@ -179,5 +241,40 @@ fn SysTick() {
                 *MAIN_LOOP_FLAGS.borrow(cs).borrow_mut() = flags;
             }
         }
+    });
+}
+
+
+#[interrupt]
+fn DMA1_CH1() {
+    cortex_m::interrupt::free(|cs| {
+        if let Some(dma) = DMA_PERIPH.borrow(cs).borrow_mut().deref_mut() {
+            dma.ifcr.write(|w| {w.ctcif1().clear()});
+            dma.ch1.cr.modify(|_,w|{w.en().disabled()}); // does not automatically disable the channel when transfer is complete !?
+            if let Some(adc) = ADC_PERIPH.borrow(cs).borrow_mut().deref_mut() {
+                adc.shutdown();
+            }
+
+            let mut flags = *MAIN_LOOP_FLAGS.borrow(cs).borrow().deref();
+            flags = flags | ADC_COMPLETE_FLAG;
+            *MAIN_LOOP_FLAGS.borrow(cs).borrow_mut() = flags;
+        };
+    });
+}
+
+#[interrupt]
+fn DMA1_CH2_3_DMA2_CH1_2() {
+    cortex_m::interrupt::free(|cs| {
+        if let Some(dma) = DMA_PERIPH.borrow(cs).borrow_mut().deref_mut() {
+            dma.ifcr.write(|w| {w.ctcif2().clear()});
+            dma.ch2.cr.modify(|_,w|{w.en().disabled()});
+            if let Some(adc) = ADC_PERIPH.borrow(cs).borrow_mut().deref_mut() {
+                adc.shutdown();
+            }
+
+            let mut flags = *MAIN_LOOP_FLAGS.borrow(cs).borrow().deref();
+            flags = flags | ADC_COMPLETE_FLAG;
+            *MAIN_LOOP_FLAGS.borrow(cs).borrow_mut() = flags;
+        };
     });
 }
